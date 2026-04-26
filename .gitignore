@@ -1,3 +1,9 @@
-*/.pytest_cache/*
-*/.env
-*/.next
+backend/.pytest_cache/*
+/backend/.env
+/frontend/.next
+
+.DS_Store
+# backend/
+# docker-compose.yml
+# frontend/
+# frontend/node_modules/
