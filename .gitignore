@@ -1,3 +1,3 @@
-backend/.pytest_cache/
-.env
-frontend/.next
+*/.pytest_cache/*
+*/.env
+*/.next
