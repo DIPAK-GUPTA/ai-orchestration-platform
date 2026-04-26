@@ -1,0 +1,160 @@
+# Run from repository root: docker compose up --build
+# (omit obsolete `version` key for Compose v2)
+# Redis: use the Compose service name `redis` in URLs (Docker embedded DNS on this network).
+# Optional: if hostname `redis` does not resolve for workers, set REDIS_HOST in project .env.
+networks:
+  orchestration:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orchestrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orchestrator_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-agentdb}
+    # Host 15432 avoids conflict when a local PostgreSQL already uses 5432.
+    # From your machine: psql -h 127.0.0.1 -p 15432 -U orchestrator agentdb
+    # Containers still use internal hostname postgres:5432 (unchanged).
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Use -d so clients don’t default to a DB named like the user ("orchestrator" — not created).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [orchestration]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Host 16379 avoids conflict when a local Redis already uses 6379. Inside the stack, use redis:6379.
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [orchestration]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    working_dir: /app
+    # Load secrets from backend/.env. Do not set OPENAI_API_KEY/ANTHROPIC_* here with
+    # ${VAR:-} — that injects an empty value when the host/compose project .env does
+    # not define the var, which overrides keys only present in this file.
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      REDIS_URL: redis://${REDIS_HOST:-redis}:6379/0
+      CELERY_BROKER_URL: redis://${REDIS_HOST:-redis}:6379/1
+      CELERY_RESULT_BACKEND: redis://${REDIS_HOST:-redis}:6379/2
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-prod}
+      # Quiets huge SQLAlchemy "INFO sqlalchemy.engine" logs on every request
+      DEBUG: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [orchestration]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    volumes:
+      - ./backend:/app
+    # --reload removed: more reliable in containers; add back for local dev if you prefer
+    command: >
+      sh -c "alembic upgrade head 2>/dev/null || true && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ./backend/.env
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      REDIS_URL: redis://${REDIS_HOST:-redis}:6379/0
+      CELERY_BROKER_URL: redis://${REDIS_HOST:-redis}:6379/1
+      CELERY_RESULT_BACKEND: redis://${REDIS_HOST:-redis}:6379/2
+      DEBUG: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [orchestration]
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 -Q agent_tasks,workflow_tasks,default
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - ./backend/.env
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD:-orchestrator_pass}@postgres:5432/${POSTGRES_DB:-agentdb}
+      REDIS_URL: redis://${REDIS_HOST:-redis}:6379/0
+      CELERY_BROKER_URL: redis://${REDIS_HOST:-redis}:6379/1
+      CELERY_RESULT_BACKEND: redis://${REDIS_HOST:-redis}:6379/2
+      DEBUG: "false"
+    depends_on:
+      celery_worker:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks: [orchestration]
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    depends_on:
+      - backend
+    networks: [orchestration]
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+
+volumes:
+  postgres_data:
+  redis_data:
